@@ -18,7 +18,7 @@ use crate::authorizer::{Authorizer, FnClaimsChecker, KeySourceType};
 use crate::error::InitError;
 use crate::jwks::key_store_manager::Refresh;
 use crate::validation::Validation;
-use crate::{AuthError, RefreshStrategy};
+use crate::{layer, AuthError, RefreshStrategy};
 
 /// Authorizer Layer builder
 ///
@@ -32,6 +32,7 @@ where
     refresh: Option<Refresh>,
     claims_checker: Option<FnClaimsChecker<C>>,
     validation: Option<Validation>,
+    jwt_source: JwtSource,
 }
 
 /// authorization layer builder
@@ -46,56 +47,95 @@ where
             refresh: Default::default(),
             claims_checker: None,
             validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
         }
     }
 
     /// Builds Authorizer Layer from a JWKS endpoint
-    pub fn from_jwks_url(url: &'static str) -> JwtAuthorizer<C> {
+    pub fn from_jwks_url(url: &str) -> JwtAuthorizer<C> {
         JwtAuthorizer {
             key_source_type: KeySourceType::Jwks(url.to_owned()),
             refresh: Default::default(),
             claims_checker: None,
             validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
         }
     }
 
     /// Builds Authorizer Layer from a RSA PEM file
-    pub fn from_rsa_pem(path: &'static str) -> JwtAuthorizer<C> {
+    pub fn from_rsa_pem(path: &str) -> JwtAuthorizer<C> {
         JwtAuthorizer {
             key_source_type: KeySourceType::RSA(path.to_owned()),
             refresh: Default::default(),
             claims_checker: None,
             validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
+        }
+    }
+
+    /// Builds Authorizer Layer from an RSA PEM raw text
+    pub fn from_rsa_pem_text(text: &str) -> JwtAuthorizer<C> {
+        JwtAuthorizer {
+            key_source_type: KeySourceType::RSAString(text.to_owned()),
+            refresh: Default::default(),
+            claims_checker: None,
+            validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
         }
     }
 
     /// Builds Authorizer Layer from a EC PEM file
-    pub fn from_ec_pem(path: &'static str) -> JwtAuthorizer<C> {
+    pub fn from_ec_pem(path: &str) -> JwtAuthorizer<C> {
         JwtAuthorizer {
             key_source_type: KeySourceType::EC(path.to_owned()),
             refresh: Default::default(),
             claims_checker: None,
             validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
+        }
+    }
+
+    /// Builds Authorizer Layer from a EC PEM raw text
+    pub fn from_ec_pem_text(text: &str) -> JwtAuthorizer<C> {
+        JwtAuthorizer {
+            key_source_type: KeySourceType::ECString(text.to_owned()),
+            refresh: Default::default(),
+            claims_checker: None,
+            validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
         }
     }
 
     /// Builds Authorizer Layer from a EC PEM file
-    pub fn from_ed_pem(path: &'static str) -> JwtAuthorizer<C> {
+    pub fn from_ed_pem(path: &str) -> JwtAuthorizer<C> {
         JwtAuthorizer {
             key_source_type: KeySourceType::ED(path.to_owned()),
             refresh: Default::default(),
             claims_checker: None,
             validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
+        }
+    }
+
+    /// Builds Authorizer Layer from a EC PEM raw text
+    pub fn from_ed_pem_text(text: &str) -> JwtAuthorizer<C> {
+        JwtAuthorizer {
+            key_source_type: KeySourceType::EDString(text.to_owned()),
+            refresh: Default::default(),
+            claims_checker: None,
+            validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
         }
     }
 
     /// Builds Authorizer Layer from a secret phrase
-    pub fn from_secret(secret: &'static str) -> JwtAuthorizer<C> {
+    pub fn from_secret(secret: &str) -> JwtAuthorizer<C> {
         JwtAuthorizer {
-            key_source_type: KeySourceType::Secret(secret),
+            key_source_type: KeySourceType::Secret(secret.to_owned()),
             refresh: Default::default(),
             claims_checker: None,
             validation: None,
+            jwt_source: JwtSource::AuthorizationHeader,
         }
     }
 
@@ -134,14 +174,22 @@ where
         self
     }
 
+    /// configures the source of the bearer token
+    ///
+    /// (default: AuthorizationHeader)
+    pub fn jwt_source(mut self, src: JwtSource) -> JwtAuthorizer<C> {
+        self.jwt_source = src;
+
+        self
+    }
+
     /// Build axum layer
     pub async fn layer(self) -> Result<AsyncAuthorizationLayer<C>, InitError> {
         let val = self.validation.unwrap_or_default();
         let auth = Arc::new(Authorizer::build(&self.key_source_type, self.claims_checker, self.refresh, val).await?);
-        Ok(AsyncAuthorizationLayer::new(auth))
+        Ok(AsyncAuthorizationLayer::new(auth, self.jwt_source))
     }
 }
-
 /// Trait for authorizing requests.
 pub trait AsyncAuthorizer<B> {
     type RequestBody;
@@ -166,10 +214,19 @@ where
     fn authorize(&self, mut request: Request<B>) -> Self::Future {
         let authorizer = self.auth.clone();
         let h = request.headers();
-        let bearer_o: Option<Authorization<Bearer>> = h.typed_get();
+
+        let token = match &self.jwt_source {
+            layer::JwtSource::AuthorizationHeader => {
+                let bearer_o: Option<Authorization<Bearer>> = h.typed_get();
+                bearer_o.map(|b| String::from(b.0.token()))
+            }
+            layer::JwtSource::Cookie(name) => h
+                .typed_get::<headers::Cookie>()
+                .and_then(|c| c.get(name.as_str()).map(String::from)),
+        };
         Box::pin(async move {
-            if let Some(bearer) = bearer_o {
-                match authorizer.check_auth(bearer.token()).await {
+            if let Some(token) = token {
+                match authorizer.check_auth(token.as_str()).await {
                     Ok(token_data) => {
                         // Set `token_data` as a request extension so it can be accessed by other
                         // services down the stack.
@@ -194,14 +251,15 @@ where
     C: Clone + DeserializeOwned + Send,
 {
     auth: Arc<Authorizer<C>>,
+    jwt_source: JwtSource,
 }
 
 impl<C> AsyncAuthorizationLayer<C>
 where
     C: Clone + DeserializeOwned + Send,
 {
-    pub fn new(auth: Arc<Authorizer<C>>) -> AsyncAuthorizationLayer<C> {
-        Self { auth }
+    pub fn new(auth: Arc<Authorizer<C>>, jwt_source: JwtSource) -> AsyncAuthorizationLayer<C> {
+        Self { auth, jwt_source }
     }
 }
 
@@ -212,11 +270,26 @@ where
     type Service = AsyncAuthorizationService<S, C>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AsyncAuthorizationService::new(inner, self.auth.clone())
+        AsyncAuthorizationService::new(inner, self.auth.clone(), self.jwt_source.clone())
     }
 }
 
 // ----------  AsyncAuthorizationService  --------
+
+/// Source of the bearer token
+#[derive(Clone)]
+pub enum JwtSource {
+    /// Storing the bearer token in Authorization header
+    ///
+    /// (default)
+    AuthorizationHeader,
+    /// Cookies
+    ///
+    /// (be careful when using cookies, some precautions must be taken, cf. RFC6750)
+    Cookie(String),
+    // TODO: "Form-Encoded Content Parameter" may be added in the future (OAuth 2.1 / 5.2.1.2)
+    // FormParam,
+}
 
 #[derive(Clone)]
 pub struct AsyncAuthorizationService<S, C>
@@ -225,6 +298,7 @@ where
 {
     pub inner: S,
     pub auth: Arc<Authorizer<C>>,
+    pub jwt_source: JwtSource,
 }
 
 impl<S, C> AsyncAuthorizationService<S, C>
@@ -253,8 +327,8 @@ where
     /// Authorize requests using a custom scheme.
     ///
     /// The `Authorization` header is required to have the value provided.
-    pub fn new(inner: S, auth: Arc<Authorizer<C>>) -> AsyncAuthorizationService<S, C> {
-        Self { inner, auth }
+    pub fn new(inner: S, auth: Arc<Authorizer<C>>, jwt_source: JwtSource) -> AsyncAuthorizationService<S, C> {
+        Self { inner, auth, jwt_source }
     }
 }
 

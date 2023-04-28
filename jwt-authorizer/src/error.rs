@@ -18,7 +18,7 @@ pub enum InitError {
     KeyFileError(#[from] std::io::Error),
 
     #[error(transparent)]
-    KeyFileDecodingError(#[from] jsonwebtoken::errors::Error),
+    KeyDecodingError(#[from] jsonwebtoken::errors::Error),
 
     #[error("Builder Error {0}")]
     DiscoveryError(String),
@@ -35,8 +35,8 @@ pub enum AuthError {
     #[error(transparent)]
     JwksSerialisationError(#[from] serde_json::Error),
 
-    #[error(transparent)]
-    JwksRefreshError(#[from] reqwest::Error),
+    #[error("JwksRefreshError {0}")]
+    JwksRefreshError(String),
 
     #[error("InvalidKey {0}")]
     InvalidKey(String),
@@ -80,7 +80,7 @@ fn response_500() -> Response<BoxBody> {
 /// (https://datatracker.ietf.org/doc/html/rfc6750#section-3.1)
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        let resp = match self {
+        match self {
             AuthError::JwksRefreshError(err) => {
                 tracing::error!("AuthErrors::JwksRefreshError: {}", err);
                 response_500()
@@ -119,8 +119,6 @@ impl IntoResponse for AuthError {
                 debug!("AuthErrors::InvalidClaims");
                 response_wwwauth(StatusCode::FORBIDDEN, "error=\"insufficient_scope\"")
             }
-        };
-
-        resp
+        }
     }
 }
